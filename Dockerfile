@@ -5,6 +5,7 @@ WORKDIR /app
 # Copy requirements first to leverage Docker cache
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir aiofiles
 
 # Copy the rest of the application
 COPY . .
@@ -13,4 +14,4 @@ COPY . .
 EXPOSE 80
 
 # Command to run the application
-CMD ["python", "bot.py"] 
+CMD ["python", "bot.py"]
