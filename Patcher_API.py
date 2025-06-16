@@ -239,6 +239,17 @@ async def verify_token(api_key: str = Security(api_key_header)):
         )
     return api_key
 
+def format_changelog_for_patcher(content, timestamp, author):
+    """Format changelog content for the patcher display"""
+    # Clean any Discord-specific formatting
+    formatted = content.strip()
+    
+    # Remove code blocks if they wrap the entire content
+    if formatted.startswith('```') and formatted.endswith('```'):
+        formatted = formatted[3:-3].strip()
+    
+    # Add any other formatting needed for the patcher
+    return formatted
 
 @app.on_event("startup")
 async def on_startup():
@@ -680,48 +691,66 @@ async def get_latest_for_patcher():
     Returns the latest changelog message in a formatted structure.
     """
     try:
-        print("\n=== Patcher requesting latest changelog ===")
+        logger.info("\n=== Patcher requesting latest changelog ===")
 
-        if not client.is_ready():
+        # Check if the changelog file exists
+        if not os.path.exists(CHANGELOG_PATH):
             raise HTTPException(
-                status_code=503, detail="Discord client is not ready")
+                status_code=404, detail="Changelog file not found")
 
-        if not changelog_channel:
-            raise HTTPException(
-                status_code=503, detail="Changelog channel not found")
+        # Read the changelog file content
+        with open(CHANGELOG_PATH, "r") as md_file:
+            content = md_file.read()
 
-        messages = [message async for message in changelog_channel.history(limit=1)]
-
-        if not messages:
+        # Parse the content to find the latest entry
+        entry_pattern = r"## Entry (\d+)[\s\S]*?(?=\n## Entry|$)"
+        entry_matches = list(re.finditer(entry_pattern, content))
+        
+        if not entry_matches:
             return {
                 "status": "success",
                 "found": False,
                 "message": "No changelog entries found"
             }
-
-        last_message = messages[0]
-
-        formatted_content = format_changelog_for_wiki(
-            last_message.content,
-            last_message.created_at,
-            last_message.author.display_name
-        )
+        
+        # Get the last entry (most recent)
+        latest_match = entry_matches[-1]
+        full_entry = latest_match.group(0).strip()
+        entry_id = latest_match.group(1)
+        
+        # Extract metadata
+        author_match = re.search(r"\*\*Author:\*\* (.*?)\n", full_entry)
+        date_match = re.search(r"\*\*Date:\*\* (.*?)\n", full_entry)
+        
+        author = author_match.group(1) if author_match else "Unknown"
+        timestamp = date_match.group(1) if date_match else "Unknown"
+        
+        # Get content part (everything after the header metadata)
+        content_part = re.sub(
+            r"^## Entry \d+\s+\*\*Author:\*\* .*?\s+\*\*Date:\*\* .*?\s+\n", 
+            "", 
+            full_entry, 
+            flags=re.DOTALL
+        ).strip()
+        
+        # Remove the trailing "---" if present
+        content_part = re.sub(r"\n---\s*$", "", content_part).strip()
 
         return {
             "status": "success",
             "found": True,
             "changelog": {
-                "raw_content": last_message.content,
-                "formatted_content": formatted_content,
-                "author": last_message.author.display_name,
-                "timestamp": last_message.created_at.isoformat(),
-                "message_id": str(last_message.id)
+                "raw_content": content_part,
+                "formatted_content": content_part,  # Can be enhanced with formatting if needed
+                "author": author,
+                "timestamp": timestamp,
+                "message_id": entry_id
             }
         }
 
     except Exception as e:
-        print(f"Error in patcher endpoint: {str(e)}")
-        print(f"Full error details: {repr(e)}")
+        logger.error(f"Error in patcher endpoint: {str(e)}")
+        logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
 
 
