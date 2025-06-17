@@ -242,6 +242,17 @@ async def verify_token(api_key: str = Security(api_key_header)):
         )
     return api_key
 
+def format_changelog_for_patcher(content, timestamp, author):
+    """Format changelog content for the patcher display"""
+    # Clean any Discord-specific formatting
+    formatted = content.strip()
+    
+    # Remove code blocks if they wrap the entire content
+    if formatted.startswith('```') and formatted.endswith('```'):
+        formatted = formatted[3:-3].strip()
+    
+    # Add any other formatting needed for the patcher
+    return formatted
 
 @app.on_event("startup")
 async def on_startup():
@@ -768,6 +779,7 @@ async def get_latest_for_patcher():
     except Exception as e:
         logger.error(f"Error in patcher endpoint: {str(e)}")
         logger.error(f"Full error details: {repr(e)}")
+
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/changelog/{message_id}", dependencies=[Depends(verify_token)])
