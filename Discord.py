@@ -133,6 +133,11 @@ async def health_check():
                 f"Interval: {current_interval}s"
             ]
             
+            #Add periodic changelog sync every 5th check
+            if check_count % 5 == 0 and changelog_channel:
+                logger.info("Performing periodic changelog sync check")
+                await sync_changelog_on_startup()
+
             # Add info about channels being monitored
             changelog_channel = client.get_channel(CHANGELOG_CHANNEL_ID)
             if changelog_channel:
@@ -409,6 +414,8 @@ async def update_changelog_file(message):
         logger.info(f"Writing updated content to changelog.md")
         with open(CHANGELOG_PATH, "w") as md_file:
             md_file.write(content)
+            md_file.flush()  # Ensure all data is written immediately
+            os.fsync(md_file.fileno())  # Ensure data is flushed to disk
             
         # Also save the last message ID to a file for tracking
         save_last_message_info(message)
@@ -418,12 +425,30 @@ async def update_changelog_file(message):
         logger.error(traceback.format_exc())
         raise
 
+def clean_discord_mentions(content):
+    """
+    Remove Discord user mentions from changelog content.
+    """
+    import re
+    
+    # Remove Discord user ID mentions in format ( <@123456789> )
+    content = re.sub(r'\s*\(\s*<@\d+>\s*\)', '', content)
+    
+    # Remove @ mentions in format ( @Username)
+    # content = re.sub(r'\s*\(\s*@[\w\s]+\)', '', content)
+    
+    # Clean up any trailing spaces left behind
+    lines = content.split('\n')
+    cleaned_lines = [line.rstrip() for line in lines]
+    
+    return '\n'.join(cleaned_lines)
+
 def format_changelog_entry(message):
     """Format a Discord message as a changelog entry"""
     entry = f"## Entry {message.id}\n"
     entry += f"**Author:** {message.author.display_name}\n"
     entry += f"**Date:** {message.created_at.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-    entry += f"{message.content}\n\n"
+    entry += f"{clean_discord_mentions(message.content)}\n\n"  
     entry += "---\n\n"
     return entry
 

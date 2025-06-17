@@ -680,57 +680,99 @@ async def get_latest_for_patcher():
     """
     Secure endpoint for the patcher to get the latest changelog entry.
     Requires X-Patcher-Token header for authentication.
-    Returns the latest changelog message in a formatted structure.
+    Returns the latest changelog message in a formatted structure with Discord mentions removed.
     """
     try:
-        print("\n=== Patcher requesting latest changelog ===")
+        logger.info("\n=== Patcher requesting latest changelog ===")
 
-        if not client.is_ready():
-            raise HTTPException(
-                status_code=503, detail="Discord client is not ready")
+        # Use the same get_changelog function with mention cleaning enabled
+        try:
+            changelogs_response = await get_changelog(all=False, clean_mentions=True)
+        except HTTPException as e:
+            # If changelog.md doesn't exist, try to fall back to Discord
+            if e.status_code == 404 and "Changelog file not found" in str(e.detail):
+                logger.warning("Changelog file not found, falling back to Discord channel")
+                
+                if not client.is_ready():
+                    raise HTTPException(
+                        status_code=503, detail="Discord client is not ready and changelog file not found")
 
-        if not changelog_channel:
-            raise HTTPException(
-                status_code=503, detail="Changelog channel not found")
+                if not changelog_channel:
+                    raise HTTPException(
+                        status_code=503, detail="Changelog channel not found and changelog file not found")
 
-        messages = [message async for message in changelog_channel.history(limit=1)]
+                messages = [message async for message in changelog_channel.history(limit=1)]
+                
+                if not messages:
+                    return {
+                        "status": "success",
+                        "found": False,
+                        "message": "No changelog entries found"
+                    }
 
-        if not messages:
+                last_message = messages[0]
+                
+                # Clean Discord mentions from the raw content
+                cleaned_content = clean_discord_mentions(last_message.content)
+                
+                formatted_content = format_changelog_for_wiki(
+                    cleaned_content,
+                    last_message.created_at,
+                    last_message.author.display_name,
+                    str(last_message.id)
+                )
+
+                return {
+                    "status": "success",
+                    "found": True,
+                    "changelog": {
+                        "raw_content": cleaned_content,
+                        "formatted_content": formatted_content,
+                        "author": last_message.author.display_name,
+                        "timestamp": last_message.created_at.isoformat(),
+                        "message_id": str(last_message.id)
+                    }
+                }
+            else:
+                raise
+        
+        if not changelogs_response["changelogs"]:
             return {
                 "status": "success",
                 "found": False,
                 "message": "No changelog entries found"
             }
 
-        last_message = messages[0]
+        latest_entry = changelogs_response["changelogs"][0]
 
+        # Format the content for wiki (content is already cleaned by get_changelog)
         formatted_content = format_changelog_for_wiki(
-            last_message.content,
-            last_message.created_at,
-            last_message.author.display_name
+            latest_entry["content"],
+            latest_entry["timestamp"],
+            latest_entry["author"],
+            latest_entry["id"]
         )
 
         return {
             "status": "success",
             "found": True,
             "changelog": {
-                "raw_content": last_message.content,
+                "raw_content": latest_entry["content"],
                 "formatted_content": formatted_content,
-                "author": last_message.author.display_name,
-                "timestamp": last_message.created_at.isoformat(),
-                "message_id": str(last_message.id)
+                "author": latest_entry["author"],
+                "timestamp": latest_entry["timestamp"],
+                "message_id": latest_entry["id"]
             }
         }
 
     except Exception as e:
-        print(f"Error in patcher endpoint: {str(e)}")
-        print(f"Full error details: {repr(e)}")
+        logger.error(f"Error in patcher endpoint: {str(e)}")
+        logger.error(f"Full error details: {repr(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.get("/changelog/{message_id}", dependencies=[Depends(verify_token)])
 @app.get("/changelog", dependencies=[Depends(verify_token)])
-async def get_changelog(message_id: Optional[str] = None, all: Optional[bool] = False):
+async def get_changelog(message_id: Optional[str] = None, all: Optional[bool] = False, clean_mentions: Optional[bool] = True):
     """
     Get changelogs from the local changelog.md file.
     Can be called as either:
@@ -740,6 +782,7 @@ async def get_changelog(message_id: Optional[str] = None, all: Optional[bool] = 
     If message_id is provided, returns all changelogs after that message.
     If no message_id is provided and all=false, returns the latest changelog.
     If all=true, returns all available changelogs.
+    If clean_mentions=true, removes Discord mentions from content.
     Requires X-Patcher-Token header for authentication.
     """
     try:
@@ -777,9 +820,12 @@ async def get_changelog(message_id: Optional[str] = None, all: Optional[bool] = 
             content_part = re.sub(
                 r"^## Entry \d+\s+\*\*Author:\*\* .*?\s+\*\*Date:\*\* .*?\s+\n", "", full_entry, flags=re.DOTALL)
 
+            # Clean Discord mentions if requested
+            cleaned_content = clean_discord_mentions(content_part.strip()) if clean_mentions else content_part.strip()
+
             messages.append({
                 "id": entry_id,
-                "content": content_part.strip(),
+                "content": cleaned_content,
                 "author": author,
                 "timestamp": timestamp,
                 "raw": full_entry
@@ -1141,25 +1187,6 @@ async def update_wiki_page(content: str, page_id: int) -> bool:
         logger.error(traceback.format_exc())
         return False
     
-def clean_discord_mentions(content):
-    """
-    Remove Discord user mentions from changelog content.
-    Removes patterns like ( <@123456789> ) from the end of lines.
-    Also handles @ mentions like (@Username).
-    """
-    # Remove Discord user ID mentions in format ( <@123456789> )
-    # This regex matches the pattern with optional spaces
-    content = re.sub(r'\s*\(\s*<@\d+>\s*\)', '', content)
-    
-    # Remove @ mentions in format ( @Username)
-    content = re.sub(r'\s*\(\s*@[\w\s]+\)', '', content)
-    
-    # Clean up any trailing spaces left behind
-    lines = content.split('\n')
-    cleaned_lines = [line.rstrip() for line in lines]
-    
-    return '\n'.join(cleaned_lines)
-
 async def start_discord():
     """Start the Discord client"""
     try:
@@ -1171,6 +1198,24 @@ async def start_discord():
     except Exception as e:
         print(f"\n❌ Connection error: {type(e).__name__}")
         raise
+    
+def clean_discord_mentions(content):
+    """
+    Remove Discord user mentions from changelog content.
+    """
+    import re
+    
+    # Remove entire parenthetical phrases containing Discord mentions
+    content = re.sub(r'\s*\([^)]*<@\d+>[^)]*\)', '', content)
+    
+    # Remove @ mentions in format ( @Username)
+    # content = re.sub(r'\s*\(\s*@[\w\s]+\)', '', content)
+    
+    # Clean up any trailing spaces left behind
+    lines = content.split('\n')
+    cleaned_lines = [line.rstrip() for line in lines]
+    
+    return '\n'.join(cleaned_lines)
 
 
 # Changelog monitoring with debouncing
@@ -1623,31 +1668,25 @@ async def post_to_reddit(entry_id: Optional[str] = None, force: bool = False, ba
             raise HTTPException(
                 status_code=500, detail="Failed to import Reddit poster module")
 
-        # Get the entry to post
+        # Get the entry to post with mentions cleaned
         if entry_id:
-            # Get specific entry
-            changelogs = await get_changelog(all=True)
+            # Get specific entry with mentions cleaned
+            changelogs = await get_changelog(all=True, clean_mentions=True)
             entry = next(
                 (e for e in changelogs["changelogs"] if e["id"] == entry_id), None)
             if not entry:
                 raise HTTPException(
                     status_code=404, detail=f"Changelog entry {entry_id} not found")
         else:
-            # Get latest entry
-            changelogs = await get_changelog(all=False)
+            # Get latest entry with mentions cleaned
+            changelogs = await get_changelog(all=False, clean_mentions=True)
             if not changelogs["changelogs"]:
                 raise HTTPException(
                     status_code=404, detail="No changelog entries found")
             entry = changelogs["changelogs"][0]
 
-        logger.info(f"Processing entry: {entry['id']} by {entry['author']}")
+        logger.info(f"Processing entry: {entry['id']} by {entry['author']} (mentions cleaned)")
 
-        # If batch mode is disabled, use the original single-entry logic
-        if not batch:
-            # Check for duplicates and post single entry
-            # (Keep existing single-entry logic here)
-            pass
-        
         # Post to Reddit using the batching function
         success, message = await reddit_poster.post_changelog_to_reddit(entry, force=force)
 
