@@ -265,7 +265,22 @@ async def on_startup():
 @app.on_event("startup")
 async def create_changelog_on_startup():
     """Create and populate the changelog.md file during startup."""
+    
+    # Check if we should skip startup sync
+    if os.getenv('PRIMARY_WRITER') != 'patcher-api' and os.getenv('ENABLE_STARTUP_SYNC', 'false').lower() != 'true':
+        logger.info("Skipping startup sync - not the primary writer")
+        # Just ensure directory exists
+        os.makedirs(os.path.dirname(CHANGELOG_PATH), exist_ok=True)
+        return
+    
+    lock = StartupLock()
     try:
+        # Acquire lock for startup operations
+        lock.acquire("patcher-api")
+        
+        # Wait a bit to let Discord.py potentially create the file first
+        await asyncio.sleep(2)
+        
         logger.info("Checking for changelog.md file...")
         file_existed = os.path.exists(CHANGELOG_PATH)
 
@@ -276,9 +291,8 @@ async def create_changelog_on_startup():
             markdown_content = "# Changelog\n\n"
             markdown_content += "This file will be populated with changelog entries.\n\n"
 
-            # Save to a Markdown file
-            with open(CHANGELOG_PATH, "w") as md_file:
-                md_file.write(markdown_content)
+            # Save to a Markdown file using atomic write
+            SafeFileOperations.atomic_write(CHANGELOG_PATH, markdown_content)
 
             logger.info("✅ Initial changelog.md created successfully!")
         else:
@@ -321,9 +335,8 @@ async def create_changelog_on_startup():
                         markdown_content += f"{log['content']}\n\n"
                         markdown_content += "---\n\n"
 
-                    # Save to the markdown file
-                    with open(CHANGELOG_PATH, "w") as md_file:
-                        md_file.write(markdown_content)
+                    # Save to the markdown file using atomic write
+                    SafeFileOperations.atomic_write(CHANGELOG_PATH, markdown_content)
 
                     logger.info(
                         "✅ Successfully populated changelog.md with all entries!")
@@ -343,6 +356,8 @@ async def create_changelog_on_startup():
 
     except Exception as e:
         logger.error(f"Error managing changelog.md file: {str(e)}")
+    finally:
+        lock.release()
 
 
 @app.on_event("startup")
@@ -802,15 +817,16 @@ async def get_changelog(message_id: Optional[str] = None, all: Optional[bool] = 
     try:
         logger.info("\n=== Fetching Changelogs from local file ===")
 
-        # Check if the changelog file exists
-        if not os.path.exists(CHANGELOG_PATH):
-            logger.error("Changelog file not found")
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(CHANGELOG_PATH), exist_ok=True)
+    
+        # Use safe read with retries
+        content = SafeFileOperations.safe_read(CHANGELOG_PATH, max_retries=5)
+        
+        if not content:
+            logger.error("Changelog file not found or empty")
             raise HTTPException(
                 status_code=404, detail="Changelog file not found")
-
-        # Read the changelog file content
-        with open(CHANGELOG_PATH, "r") as md_file:
-            content = md_file.read()
 
         # Parse the content into changelog entries with complete raw content
         messages = []
