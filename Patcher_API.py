@@ -780,7 +780,6 @@ async def get_latest_for_patcher():
             latest_entry["author"],
             latest_entry["id"]
         )
-
         return {
             "status": "success",
             "found": True,
