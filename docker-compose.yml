@@ -30,6 +30,7 @@ services:
       - REDDIT_FLAIR_NAME=${REDDIT_FLAIR_NAME:-}
     volumes:
       - ./logs:/app/logs
+      - ./data:/app/data
     networks:
       - changelog-network
     command: ['python', 'Patcher_API.py']
@@ -47,6 +48,7 @@ services:
       - PYTHONUNBUFFERED=1
     volumes:
       - ./logs:/app/logs
+      - ./data:/app/data
     networks:
       - changelog-network
     command: ['python', 'Discord.py']

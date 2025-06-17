@@ -88,6 +88,9 @@ CHANGELOG_PATH = "/app/changelog.md"
 # Add path for ServerStatus.md
 SERVER_STATUS_PATH = "/app/ServerStatus.md"
 
+# Add path for changelog processing state
+PROCESSING_STATE_PATH = "/app/changelog_processing_state.json"
+
 
 def mask_sensitive_string(s: str) -> str:
     """Mask sensitive string by showing only first and last 4 characters"""
@@ -688,75 +691,100 @@ async def get_latest_for_patcher():
     """
     Secure endpoint for the patcher to get the latest changelog entry.
     Requires X-Patcher-Token header for authentication.
-    Returns the latest changelog message in a formatted structure.
+    Returns the latest changelog message in a formatted structure with Discord mentions removed.
     """
     try:
         logger.info("\n=== Patcher requesting latest changelog ===")
 
-        # Check if the changelog file exists
-        if not os.path.exists(CHANGELOG_PATH):
-            raise HTTPException(
-                status_code=404, detail="Changelog file not found")
+        # Use the same get_changelog function with mention cleaning enabled
+        try:
+            changelogs_response = await get_changelog(all=False, clean_mentions=True)
+        except HTTPException as e:
+            # If changelog.md doesn't exist, try to fall back to Discord
+            if e.status_code == 404 and "Changelog file not found" in str(e.detail):
+                logger.warning("Changelog file not found, falling back to Discord channel")
+                
+                if not client.is_ready():
+                    raise HTTPException(
+                        status_code=503, detail="Discord client is not ready and changelog file not found")
 
-        # Read the changelog file content
-        with open(CHANGELOG_PATH, "r") as md_file:
-            content = md_file.read()
+                if not changelog_channel:
+                    raise HTTPException(
+                        status_code=503, detail="Changelog channel not found and changelog file not found")
 
-        # Parse the content to find the latest entry
-        entry_pattern = r"## Entry (\d+)[\s\S]*?(?=\n## Entry|$)"
-        entry_matches = list(re.finditer(entry_pattern, content))
+                messages = [message async for message in changelog_channel.history(limit=1)]
+                
+                if not messages:
+                    return {
+                        "status": "success",
+                        "found": False,
+                        "message": "No changelog entries found"
+                    }
+
+                last_message = messages[0]
+                
+                # Clean Discord mentions from the raw content
+                cleaned_content = clean_discord_mentions(last_message.content)
+                
+                formatted_content = format_changelog_for_wiki(
+                    cleaned_content,
+                    last_message.created_at,
+                    last_message.author.display_name,
+                    str(last_message.id)
+                )
+
+                return {
+                    "status": "success",
+                    "found": True,
+                    "changelog": {
+                        "raw_content": cleaned_content,
+                        "formatted_content": formatted_content,
+                        "author": last_message.author.display_name,
+                        "timestamp": last_message.created_at.isoformat(),
+                        "message_id": str(last_message.id)
+                    }
+                }
+            else:
+                raise
         
-        if not entry_matches:
+        if not changelogs_response["changelogs"]:
             return {
                 "status": "success",
                 "found": False,
                 "message": "No changelog entries found"
             }
-        
-        # Get the last entry (most recent)
-        latest_match = entry_matches[-1]
-        full_entry = latest_match.group(0).strip()
-        entry_id = latest_match.group(1)
-        
-        # Extract metadata
-        author_match = re.search(r"\*\*Author:\*\* (.*?)\n", full_entry)
-        date_match = re.search(r"\*\*Date:\*\* (.*?)\n", full_entry)
-        
-        author = author_match.group(1) if author_match else "Unknown"
-        timestamp = date_match.group(1) if date_match else "Unknown"
-        
-        # Get content part (everything after the header metadata)
-        content_part = re.sub(
-            r"^## Entry \d+\s+\*\*Author:\*\* .*?\s+\*\*Date:\*\* .*?\s+\n", 
-            "", 
-            full_entry, 
-            flags=re.DOTALL
-        ).strip()
-        
-        # Remove the trailing "---" if present
-        content_part = re.sub(r"\n---\s*$", "", content_part).strip()
+
+        latest_entry = changelogs_response["changelogs"][0]
+
+        # Format the content for wiki (content is already cleaned by get_changelog)
+        formatted_content = format_changelog_for_wiki(
+            latest_entry["content"],
+            latest_entry["timestamp"],
+            latest_entry["author"],
+            latest_entry["id"]
+        )
 
         return {
             "status": "success",
             "found": True,
             "changelog": {
-                "raw_content": content_part,
-                "formatted_content": content_part,  # Can be enhanced with formatting if needed
-                "author": author,
-                "timestamp": timestamp,
-                "message_id": entry_id
+                "raw_content": latest_entry["content"],
+                "formatted_content": formatted_content,
+                "author": latest_entry["author"],
+                "timestamp": latest_entry["timestamp"],
+                "message_id": latest_entry["id"]
             }
         }
 
     except Exception as e:
         logger.error(f"Error in patcher endpoint: {str(e)}")
-        logger.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Full error details: {repr(e)}")
 
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/changelog/{message_id}", dependencies=[Depends(verify_token)])
 @app.get("/changelog", dependencies=[Depends(verify_token)])
-async def get_changelog(message_id: Optional[str] = None, all: Optional[bool] = False):
+async def get_changelog(message_id: Optional[str] = None, all: Optional[bool] = False, clean_mentions: Optional[bool] = True):
     """
     Get changelogs from the local changelog.md file.
     Can be called as either:
@@ -766,6 +794,7 @@ async def get_changelog(message_id: Optional[str] = None, all: Optional[bool] = 
     If message_id is provided, returns all changelogs after that message.
     If no message_id is provided and all=false, returns the latest changelog.
     If all=true, returns all available changelogs.
+    If clean_mentions=true, removes Discord mentions from content.
     Requires X-Patcher-Token header for authentication.
     """
     try:
@@ -803,9 +832,12 @@ async def get_changelog(message_id: Optional[str] = None, all: Optional[bool] = 
             content_part = re.sub(
                 r"^## Entry \d+\s+\*\*Author:\*\* .*?\s+\*\*Date:\*\* .*?\s+\n", "", full_entry, flags=re.DOTALL)
 
+            # Clean Discord mentions if requested
+            cleaned_content = clean_discord_mentions(content_part.strip()) if clean_mentions else content_part.strip()
+
             messages.append({
                 "id": entry_id,
-                "content": content_part.strip(),
+                "content": cleaned_content,
                 "author": author,
                 "timestamp": timestamp,
                 "raw": full_entry
@@ -850,57 +882,194 @@ async def get_changelog(message_id: Optional[str] = None, all: Optional[bool] = 
     except Exception as e:
         logger.error(f"Error fetching changelogs: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/wiki/update-changelog", dependencies=[Depends(verify_token)])
-async def update_wiki_with_all_changelogs():
+    
+async def get_wiki_page_content(page_id: int) -> str:
     """
-    Fetch all changelogs and update the wiki page with them.
-    Requires X-Patcher-Token header for authentication.
+    Fetch the current content of a wiki page.
+    Returns the page content as a string, or None if failed.
     """
-    print("\n=== Starting Wiki Changelog Update ===")
-
-    # Check if wiki integration is configured
-    if not all([WIKI_API_URL, WIKI_API_KEY, WIKI_PAGE_ID]):
-        raise HTTPException(
-            status_code=500,
-            detail="Wiki integration is not fully configured. Please set WIKI_API_URL, WIKI_API_KEY, and WIKI_PAGE_ID."
-        )
-
     try:
-        # Get all changelogs using existing endpoint logic
-        changelogs = await get_changelog(all=True)
-
-        if not changelogs["total"]:
-            return {
-                "status": "success",
-                "message": "No changelogs found to update"
+        headers = {
+            'Authorization': f'Bearer {WIKI_API_KEY}',
+            'Content-Type': 'application/json'
+        }
+        
+        # GraphQL query to fetch page content
+        query = """
+        query GetPage($id: Int!) {
+          pages {
+            single(id: $id) {
+              content
+              updatedAt
             }
-
-        # Format all changelogs for wiki
-        formatted_content = "# Changelog\n\n"
-        for changelog in changelogs["changelogs"]:
-            formatted_content += changelog["formatted_content"]
-
-        # Update the wiki page
-        page_id = int(WIKI_PAGE_ID)
-        success = await update_wiki_page(formatted_content, page_id)
-
-        if success:
-            return {
-                "status": "success",
-                "message": f"Successfully updated wiki with {changelogs['total']} changelog entries",
-                "total_entries": changelogs["total"]
-            }
-        else:
-            raise HTTPException(
-                status_code=500,
-                detail="Failed to update wiki page"
-            )
-
+          }
+        }
+        """
+        
+        variables = {
+            "id": page_id
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                WIKI_API_URL,
+                json={"query": query, "variables": variables},
+                headers=headers
+            ) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if 'errors' in data:
+                        logger.error(f"GraphQL errors fetching wiki page: {data['errors']}")
+                        return None
+                    
+                    page_data = data.get('data', {}).get('pages', {}).get('single', {})
+                    return page_data.get('content', '')
+                else:
+                    logger.error(f"Failed to fetch wiki page: HTTP {response.status}")
+                    return None
+                    
     except Exception as e:
-        print(f"❌ Error updating wiki with changelogs: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Error fetching wiki page content: {str(e)}")
+        return None
+
+def parse_existing_changelog_ids(wiki_content: str) -> set:
+    """
+    Parse the wiki content to extract existing changelog entry IDs.
+    Returns a set of entry IDs that are already in the wiki.
+    """
+    existing_ids = set()
+    
+    # Look for entry IDs in the wiki content
+    import re
+    
+    # Multiple patterns to catch different formats
+    patterns = [
+        r'Entry ID:\s*(\d+)',  # Entry ID: 1234567890
+        r'Entry\s+(\d+)',      # Entry 1234567890
+        r'Message ID:\s*(\d+)', # Message ID: 1234567890
+        r'## Entry (\d+)',     # ## Entry 1234567890 (changelog.md format)
+        r'## \d{4}-\d{2}-\d{2} \d{2}:\d{2} - Entry (\d+)',  # ## 2024-02-24 02:59 - Entry 1234567890 (wiki format)
+        r'- Entry (\d+)',      # - Entry 1234567890
+    ]
+    
+    for pattern in patterns:
+        matches = re.findall(pattern, wiki_content, re.IGNORECASE)
+        existing_ids.update(matches)
+    
+    logger.info(f"Found {len(existing_ids)} existing entries in wiki")
+    return existing_ids
+
+async def update_wiki_with_new_entries(new_entries):
+    """
+    Update the wiki with only new changelog entries.
+    New entries are prepended (newest at top).
+    Discord mentions are cleaned before posting.
+    """
+    if not all([WIKI_API_URL, WIKI_API_KEY, WIKI_PAGE_ID]):
+        logger.info("Wiki integration not configured, skipping wiki update")
+        return False
+        
+    try:
+        page_id = int(WIKI_PAGE_ID)
+        
+        # Step 1: Get current wiki content
+        logger.info("Fetching current wiki page content...")
+        current_content = await get_wiki_page_content(page_id)
+        
+        if current_content is None:
+            logger.error("Failed to fetch current wiki content")
+            return False
+            
+        # Step 2: Parse existing entry IDs
+        existing_ids = parse_existing_changelog_ids(current_content)
+        
+        # Step 3: Filter out entries that already exist
+        entries_to_add = []
+        for entry in new_entries:
+            if str(entry['id']) not in existing_ids:
+                entries_to_add.append(entry)
+        
+        if not entries_to_add:
+            logger.info("No new entries to add to wiki")
+            return True
+            
+        logger.info(f"Adding {len(entries_to_add)} new entries to wiki")
+        
+        # Step 4: Sort entries by ID/timestamp in DESCENDING order (newest first)
+        entries_to_add.sort(key=lambda x: int(x['id']), reverse=True)
+        
+        # Step 5: Format new entries (newest first)
+        new_content_section = ""
+        for entry in entries_to_add:
+            # Format each entry
+            try:
+                entry_time = datetime.fromisoformat(entry["timestamp"].replace("Z", "+00:00")).strftime("%Y-%m-%d %H:%M")
+            except:
+                entry_time = entry["timestamp"]
+                
+            new_content_section += f"## {entry_time} - Entry {entry['id']}\n"
+            new_content_section += f"**Author:** {entry['author']}\n\n"
+            
+            # Clean Discord mentions from content
+            content = entry['content'].strip()
+            cleaned_content = clean_discord_mentions(content)
+            
+            # If content is in code blocks, preserve them
+            if cleaned_content.startswith('```'):
+                new_content_section += cleaned_content + "\n\n"
+            else:
+                new_content_section += cleaned_content + "\n\n"
+            new_content_section += "---\n\n"
+        
+        # Step 6: Prepend new content after header
+        if not current_content.strip():
+            # Empty page, start fresh
+            updated_content = WIKI_HEADER + "\n\n" + new_content_section
+        else:
+            # Split content to find header and existing entries
+            if WIKI_HEADER in current_content:
+                # Split at the header
+                parts = current_content.split(WIKI_HEADER, 1)
+                if len(parts) == 2:
+                    # Everything after the header
+                    content_after_header = parts[1]
+                    
+                    # Find where the actual changelog entries start
+                    # Updated regex to match the wiki format: ## YYYY-MM-DD HH:MM - Entry ID
+                    import re
+                    first_entry_match = re.search(r'\n(## \d{4}-\d{2}-\d{2} \d{2}:\d{2} - Entry \d+)', content_after_header)
+                    
+                    if first_entry_match:
+                        # There are existing entries
+                        pre_entry_content = content_after_header[:first_entry_match.start()]
+                        existing_entries = content_after_header[first_entry_match.start():]
+                        
+                        # Reconstruct: Header + any content before entries + new entries + existing entries
+                        updated_content = WIKI_HEADER + pre_entry_content + "\n" + new_content_section + existing_entries
+                    else:
+                        # No existing entries found, just append new content after header
+                        updated_content = WIKI_HEADER + content_after_header + "\n" + new_content_section
+                else:
+                    # Fallback - prepend to everything
+                    updated_content = WIKI_HEADER + "\n\n" + new_content_section + current_content
+            else:
+                # No header found, add header and new content at the top
+                updated_content = WIKI_HEADER + "\n\n" + new_content_section + current_content
+        
+        # Step 7: Update the wiki page
+        success = await update_wiki_page(updated_content, page_id)
+        
+        if success:
+            logger.info(f"Successfully updated wiki with {len(entries_to_add)} new entries (prepended, Discord mentions cleaned)")
+            return True
+        else:
+            logger.error("Failed to update wiki page")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error updating wiki with new entries: {str(e)}")
+        logger.error(traceback.format_exc())
+        return False
 
 
 async def update_wiki_page(content: str, page_id: int) -> bool:
@@ -958,80 +1127,36 @@ async def update_wiki_page(content: str, page_id: int) -> bool:
         logger.info(
             f"- Variables: id={page_id}, content_length={len(content)}")
 
-        async with aiohttp.ClientSession() as session:
+        # Add timeout to prevent hanging
+        timeout = aiohttp.ClientTimeout(total=30)
+        
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             # Step 1: Update content with isPublished
             logger.info("\nExecuting update mutation...")
-            async with session.post(
-                WIKI_API_URL,
-                json={"query": update_mutation, "variables": variables},
-                headers=headers
-            ) as response:
-                response_status = response.status
-                response_data = await response.json()
-
-                logger.info(f"\nUpdate Response Analysis:")
-                logger.info(f"- HTTP Status: {response_status}")
-                logger.info(
-                    f"- Raw Response: {json.dumps(response_data, indent=2)}")
-
-                if 'errors' in response_data:
-                    logger.error("\nGraphQL Errors in update:")
-                    for error in response_data['errors']:
-                        logger.error(f"- Path: {error.get('path', 'N/A')}")
-                        logger.error(
-                            f"- Message: {error.get('message', 'N/A')}")
-                        logger.error(
-                            f"- Extensions: {error.get('extensions', {})}")
-                    return False
-
-                update_result = response_data.get('data', {}).get(
-                    'pages', {}).get('update', {}).get('responseResult', {})
-
-                # Continue even if we get the map error, as we know the update still works
-                if update_result.get('message') == "Cannot read properties of undefined (reading 'map')":
-                    logger.warning(
-                        "\n⚠️ Received 'map' error but continuing as this is expected")
-                elif not update_result.get('succeeded', False):
-                    logger.error(
-                        f"\n❌ Failed to update page: {update_result.get('message', 'Unknown error')}")
-                    return False
-
-                # Step 2: Render the page
-                render_mutation = """
-                mutation RenderPage($id: Int!) {
-                  pages {
-                    render(id: $id) {
-                      responseResult {
-                        succeeded
-                        message
-                      }
-                    }
-                  }
-                }
-                """
-
-                render_variables = {
-                    "id": page_id
-                }
-
-                logger.info("\nExecuting render mutation...")
+            try:
                 async with session.post(
                     WIKI_API_URL,
-                    json={"query": render_mutation,
-                          "variables": render_variables},
+                    json={"query": update_mutation, "variables": variables},
                     headers=headers
-                ) as render_response:
-                    render_status = render_response.status
-                    render_data = await render_response.json()
+                ) as response:
+                    response_status = response.status
+                    response_text = await response.text()
+                    
+                    logger.info(f"\nUpdate Response Analysis:")
+                    logger.info(f"- HTTP Status: {response_status}")
+                    
+                    # Try to parse as JSON
+                    try:
+                        response_data = json.loads(response_text)
+                        logger.info(
+                            f"- Raw Response: {json.dumps(response_data, indent=2)}")
+                    except json.JSONDecodeError:
+                        logger.error(f"- Raw Response (not JSON): {response_text[:500]}")
+                        return False
 
-                    logger.info(f"\nRender Response Analysis:")
-                    logger.info(f"- HTTP Status: {render_status}")
-                    logger.info(
-                        f"- Raw Response: {json.dumps(render_data, indent=2)}")
-
-                    if 'errors' in render_data:
-                        logger.error("\nGraphQL Errors in render:")
-                        for error in render_data['errors']:
+                    if 'errors' in response_data:
+                        logger.error("\nGraphQL Errors in update:")
+                        for error in response_data['errors']:
                             logger.error(f"- Path: {error.get('path', 'N/A')}")
                             logger.error(
                                 f"- Message: {error.get('message', 'N/A')}")
@@ -1039,23 +1164,41 @@ async def update_wiki_page(content: str, page_id: int) -> bool:
                                 f"- Extensions: {error.get('extensions', {})}")
                         return False
 
-                    render_result = render_data.get('data', {}).get(
-                        'pages', {}).get('render', {}).get('responseResult', {})
+                    update_result = response_data.get('data', {}).get(
+                        'pages', {}).get('update', {}).get('responseResult', {})
 
-                    if not render_result.get('succeeded', False):
-                        logger.error(
-                            f"\n❌ Failed to render page: {render_result.get('message', 'Unknown error')}")
-                        return False
-
-                    logger.info("\n✅ Successfully rendered page")
-                    return True
+                    # Check if update was successful
+                    if update_result.get('succeeded', False):
+                        logger.info(f"\n✅ Successfully updated page")
+                        logger.info(f"- Slug: {update_result.get('slug', 'N/A')}")
+                        logger.info(f"- Message: {update_result.get('message', 'N/A')}")
+                        return True
+                    else:
+                        # Handle the known 'map' error
+                        if update_result.get('message') == "Cannot read properties of undefined (reading 'map')":
+                            logger.warning(
+                                "\n⚠️ Received 'map' error - this might be a Wiki.js bug but the update may have succeeded")
+                            # You might want to verify the update by fetching the page
+                            return True
+                        else:
+                            logger.error(
+                                f"\n❌ Failed to update page: {update_result.get('message', 'Unknown error')}")
+                            logger.error(f"- Error Code: {update_result.get('errorCode', 'N/A')}")
+                            return False
+                            
+            except asyncio.TimeoutError:
+                logger.error("\n❌ Request timed out after 30 seconds")
+                return False
+            except aiohttp.ClientError as e:
+                logger.error(f"\n❌ HTTP Client Error: {str(e)}")
+                return False
 
     except Exception as e:
         logger.error(f"❌ Error in update_wiki_page: {type(e).__name__}")
         logger.error(f"Error details: {str(e)}")
+        logger.error(traceback.format_exc())
         return False
-
-
+    
 async def start_discord():
     """Start the Discord client"""
     try:
@@ -1067,6 +1210,298 @@ async def start_discord():
     except Exception as e:
         print(f"\n❌ Connection error: {type(e).__name__}")
         raise
+    
+def clean_discord_mentions(content):
+    """
+    Remove Discord user mentions from changelog content.
+    """
+    import re
+    
+    # Remove entire parenthetical phrases containing Discord mentions
+    content = re.sub(r'\s*\([^)]*<@\d+>[^)]*\)', '', content)
+    
+    # Remove @ mentions in format ( @Username)
+    # content = re.sub(r'\s*\(\s*@[\w\s]+\)', '', content)
+    
+    # Clean up any trailing spaces left behind
+    lines = content.split('\n')
+    cleaned_lines = [line.rstrip() for line in lines]
+    
+    return '\n'.join(cleaned_lines)
+
+
+# Changelog monitoring with debouncing
+class ChangelogMonitor:
+    """Monitor changelog.md for changes and batch process updates with debouncing"""
+    
+    def __init__(self):
+        self.last_processed_entry_id = None
+        self.pending_entries = []
+        self.debounce_timer = None
+        self.file_last_modified = None
+        self.monitoring_active = True
+        self.file_hash = None
+        self.load_state()
+        
+    def load_state(self):
+        """Load processing state from file"""
+        try:
+            if os.path.exists(PROCESSING_STATE_PATH):
+                with open(PROCESSING_STATE_PATH, 'r') as f:
+                    state = json.load(f)
+                    self.last_processed_entry_id = state.get('last_processed_entry_id')
+                    logger.info(f"Loaded state: last processed entry {self.last_processed_entry_id}")
+        except Exception as e:
+            logger.error(f"Error loading processing state: {str(e)}")
+    
+    def save_state(self):
+        """Save processing state to file"""
+        try:
+            state = {
+                'last_processed_entry_id': self.last_processed_entry_id,
+                'last_updated': datetime.now().isoformat()
+            }
+            with open(PROCESSING_STATE_PATH, 'w') as f:
+                json.dump(state, f, indent=2)
+            logger.info(f"Saved state: last processed entry {self.last_processed_entry_id}")
+        except Exception as e:
+            logger.error(f"Error saving processing state: {str(e)}")
+    
+    async def detect_new_entries(self):
+        """Detect new entries in changelog.md"""
+        try:
+            if not os.path.exists(CHANGELOG_PATH):
+                return []
+            
+            # Read the changelog file
+            with open(CHANGELOG_PATH, 'r') as f:
+                content = f.read()
+            
+            # Parse entries
+            new_entries = []
+            entry_pattern = r"## Entry (\d+)\n\*\*Author:\*\* (.*?)\n\*\*Date:\*\* (.*?)\n\n([\s\S]*?)(?=\n---\n|$)"
+            
+            for match in re.finditer(entry_pattern, content):
+                entry_id = match.group(1)
+                author = match.group(2)
+                timestamp = match.group(3)
+                entry_content = match.group(4).strip()
+                
+                # Check if this is a new entry
+                if self.last_processed_entry_id is None or int(entry_id) > int(self.last_processed_entry_id):
+                    new_entries.append({
+                        'id': entry_id,
+                        'author': author,
+                        'timestamp': timestamp,
+                        'content': entry_content
+                    })
+            
+            # Sort by ID to ensure correct order
+            new_entries.sort(key=lambda x: int(x['id']))
+            
+            if new_entries:
+                logger.info(f"Detected {len(new_entries)} new entries")
+                
+            return new_entries
+            
+        except Exception as e:
+            logger.error(f"Error detecting new entries: {str(e)}")
+            logger.error(traceback.format_exc())
+            return []
+    
+    async def monitor_changelog_file(self):
+        """Monitor changelog.md for changes with debouncing"""
+        logger.info("Starting changelog file monitor")
+        
+        # Initial check for any unprocessed entries
+        initial_entries = await self.detect_new_entries()
+        if initial_entries:
+            logger.info(f"Found {len(initial_entries)} unprocessed entries on startup")
+            await self.handle_new_entries(initial_entries)
+        
+        while self.monitoring_active:
+            try:
+                if not os.path.exists(CHANGELOG_PATH):
+                    await asyncio.sleep(5)
+                    continue
+                
+                # Check file modification time
+                current_mtime = os.path.getmtime(CHANGELOG_PATH)
+                
+                # Also check file content hash for more reliable change detection
+                with open(CHANGELOG_PATH, 'rb') as f:
+                    import hashlib
+                    current_hash = hashlib.md5(f.read()).hexdigest()
+                
+                if (self.file_last_modified and current_mtime > self.file_last_modified) or \
+                   (self.file_hash and current_hash != self.file_hash):
+                    # File has changed
+                    logger.info("Changelog file change detected")
+                    new_entries = await self.detect_new_entries()
+                    
+                    if new_entries:
+                        await self.handle_new_entries(new_entries)
+                
+                self.file_last_modified = current_mtime
+                self.file_hash = current_hash
+                
+                await asyncio.sleep(5)  # Check every 5 seconds
+                
+            except Exception as e:
+                logger.error(f"Error monitoring changelog: {str(e)}")
+                logger.error(traceback.format_exc())
+                await asyncio.sleep(5)
+    
+    async def handle_new_entries(self, new_entries):
+        """Handle new entries with debouncing"""
+        # Add new entries to pending list (avoid duplicates)
+        existing_ids = {e['id'] for e in self.pending_entries}
+        for entry in new_entries:
+            if entry['id'] not in existing_ids:
+                self.pending_entries.append(entry)
+        
+        # Log the first entry if this is a new batch
+        if self.debounce_timer is None and self.pending_entries:
+            logger.info(f"First new entry detected: {self.pending_entries[0]['id']} by {self.pending_entries[0]['author']}")
+        
+        # Cancel existing timer if any
+        if self.debounce_timer and not self.debounce_timer.done():
+            self.debounce_timer.cancel()
+            logger.info(f"Timer reset. Now tracking {len(self.pending_entries)} pending entries")
+        
+        # Start new 5-minute timer
+        logger.info(f"Starting 5-minute timer for {len(self.pending_entries)} entries")
+        self.debounce_timer = asyncio.create_task(self.process_after_delay())
+    
+    async def process_after_delay(self):
+        """Wait for 5 minutes then process all pending entries"""
+        try:
+            logger.info(f"Waiting 5 minutes before processing {len(self.pending_entries)} entries")
+            await asyncio.sleep(300)  # 5 minutes
+            
+            # Process all pending entries
+            await self.process_pending_entries()
+            
+        except asyncio.CancelledError:
+            logger.info("Timer cancelled - new entries detected")
+            raise
+    
+    async def process_pending_entries(self):
+        """Process all accumulated entries"""
+        if not self.pending_entries:
+            return
+        
+        logger.info(f"Processing {len(self.pending_entries)} changelog entries")
+        force_azure_log(f"Processing batch of {len(self.pending_entries)} changelog entries")
+        
+        try:
+            # Sort by ID to ensure correct order (ascending for processing)
+            self.pending_entries.sort(key=lambda x: int(x['id']))
+            
+            # Get the latest entry for primary operations
+            latest_entry = self.pending_entries[-1]
+            
+            # Process Reddit posting if configured
+            if await self.should_post_to_reddit():
+                await self.post_batch_to_reddit(latest_entry)
+            
+            # Update Wiki with new entries if configured
+            # The wiki update function will handle reverse ordering internally
+            if await self.should_update_wiki():
+                await update_wiki_with_new_entries(self.pending_entries)
+            
+            # Update last processed ID
+            self.last_processed_entry_id = latest_entry['id']
+            self.save_state()
+            
+            logger.info(f"Successfully processed entries up to {self.last_processed_entry_id}")
+            
+            # Clear pending entries and timer
+            self.pending_entries = []
+            self.debounce_timer = None
+            
+        except Exception as e:
+            logger.error(f"Error processing entries: {str(e)}")
+            logger.error(traceback.format_exc())
+            # Don't clear pending entries on error - we'll retry
+    
+    async def should_post_to_reddit(self):
+        """Check if Reddit posting is configured and enabled"""
+        return all([
+            os.getenv('REDDIT_CLIENT_ID'),
+            os.getenv('REDDIT_CLIENT_SECRET'),
+            os.getenv('REDDIT_USERNAME'),
+            os.getenv('REDDIT_PASSWORD'),
+            os.getenv('REDDIT_SUBREDDIT')
+        ])
+    
+    async def should_update_wiki(self):
+        """Check if Wiki updating is configured and enabled"""
+        return all([WIKI_API_URL, WIKI_API_KEY, WIKI_PAGE_ID])
+    
+    async def post_batch_to_reddit(self, latest_entry):
+        """Post the latest entry to Reddit (which will check for batching)"""
+        try:
+            reddit_poster = import_reddit_poster()
+            if not reddit_poster:
+                logger.error("Failed to import Reddit poster")
+                return
+            
+            logger.info(f"Posting to Reddit: entry {latest_entry['id']}")
+            success, message = await reddit_poster.post_changelog_to_reddit(latest_entry)
+            
+            if success:
+                logger.info(f"Reddit post successful: {message}")
+            else:
+                logger.error(f"Reddit post failed: {message}")
+                
+        except Exception as e:
+            logger.error(f"Error posting to Reddit: {str(e)}")
+            logger.error(traceback.format_exc())
+    
+    async def update_wiki_with_entries(self):
+        """Update Wiki with all changelogs"""
+        try:
+            logger.info("Updating Wiki with latest changelogs")
+            
+            # Get all changelogs
+            changelogs = await get_changelog(all=True)
+            
+            if not changelogs["total"]:
+                logger.warning("No changelogs found for Wiki update")
+                return
+            
+            # Format all changelogs for wiki
+            formatted_content = WIKI_HEADER + "\n\n"
+            for changelog in changelogs["changelogs"]:
+                # Add formatted content
+                formatted_content += f"## {changelog['timestamp']}\n"
+                formatted_content += f"**Author:** {changelog['author']}\n\n"
+                formatted_content += changelog['content'] + "\n\n"
+                formatted_content += "---\n\n"
+            
+            # Update the wiki page
+            page_id = int(WIKI_PAGE_ID)
+            success = await update_wiki_page(formatted_content, page_id)
+            
+            if success:
+                logger.info(f"Wiki updated with {changelogs['total']} entries")
+            else:
+                logger.error("Failed to update Wiki")
+                
+        except Exception as e:
+            logger.error(f"Error updating Wiki: {str(e)}")
+            logger.error(traceback.format_exc())
+    
+    async def force_process(self):
+        """Force immediate processing of pending entries"""
+        if self.debounce_timer and not self.debounce_timer.done():
+            self.debounce_timer.cancel()
+        
+        if self.pending_entries:
+            await self.process_pending_entries()
+            return True
+        return False
 
 
 async def start_api():
@@ -1132,7 +1567,69 @@ async def start_api():
         logger.error(f"Error type: {type(e).__name__}")
         raise
 
+# Create the changelog monitor instance
+changelog_monitor = ChangelogMonitor()
 
+# Changelog monitoring startup
+@app.on_event("startup")
+async def start_changelog_monitor():
+    """Start the changelog monitoring task"""
+    asyncio.create_task(changelog_monitor.monitor_changelog_file())
+    logger.info("Changelog monitor started with 5-minute debouncing")
+    force_azure_log("Changelog monitor started - will batch process updates with 5-minute delay")
+
+# Monitor endpoints
+@app.post("/process-pending", dependencies=[Depends(verify_token)])
+async def process_pending_manually():
+    """Manually trigger processing of pending entries"""
+    if await changelog_monitor.force_process():
+        return {
+            "status": "success", 
+            "message": f"Processed {len(changelog_monitor.pending_entries)} entries"
+        }
+    return {"status": "success", "message": "No pending entries to process"}
+
+@app.get("/monitor-status", dependencies=[Depends(verify_token)])
+async def get_monitor_status():
+    """Get current monitoring status"""
+    timer_remaining = None
+    if changelog_monitor.debounce_timer and not changelog_monitor.debounce_timer.done():
+        # This is approximate since we can't easily track exact remaining time
+        timer_remaining = "Active (up to 5 minutes remaining)"
+    
+    return {
+        "monitoring_active": changelog_monitor.monitoring_active,
+        "last_processed_entry": changelog_monitor.last_processed_entry_id,
+        "pending_entries_count": len(changelog_monitor.pending_entries),
+        "pending_entries": [
+            {"id": e['id'], "author": e['author'], "timestamp": e['timestamp']} 
+            for e in changelog_monitor.pending_entries
+        ],
+        "timer_active": changelog_monitor.debounce_timer is not None and not changelog_monitor.debounce_timer.done(),
+        "timer_status": timer_remaining,
+        "file_last_modified": datetime.fromtimestamp(changelog_monitor.file_last_modified).isoformat() if changelog_monitor.file_last_modified else None
+    }
+
+@app.post("/monitor-control", dependencies=[Depends(verify_token)])
+async def control_monitor(action: str):
+    """Control the monitoring system"""
+    if action == "pause":
+        changelog_monitor.monitoring_active = False
+        return {"status": "success", "message": "Monitoring paused"}
+    elif action == "resume":
+        changelog_monitor.monitoring_active = True
+        return {"status": "success", "message": "Monitoring resumed"}
+    elif action == "reset":
+        # Reset state but keep last processed ID
+        changelog_monitor.pending_entries = []
+        if changelog_monitor.debounce_timer:
+            changelog_monitor.debounce_timer.cancel()
+        changelog_monitor.debounce_timer = None
+        return {"status": "success", "message": "Monitor state reset"}
+    else:
+        raise HTTPException(status_code=400, detail="Invalid action. Use 'pause', 'resume', or 'reset'")
+
+# Reddit posting with duplicate checking and batching
 def import_reddit_poster():
     """Import the Reddit poster module."""
     try:
@@ -1155,12 +1652,23 @@ async def post_to_reddit(entry_id: Optional[str] = None, force: bool = False, ba
     
     Parameters:
     - entry_id: Specific entry ID to post (optional)
-    - force: If True, bypasses duplicate checking (optional)
+    - force: If True, bypasses duplicate checking and monitor warnings (optional)
     - batch: If True, includes nearby entries in the same post (default: True)
     
     Requires X-Patcher-Token header for authentication.
     """
     try:
+        # Check monitor state first
+        if changelog_monitor.pending_entries and not force:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Monitor has {len(changelog_monitor.pending_entries)} pending entries. "
+                       f"Use force=true to override or wait for automatic processing."
+            )
+        
+        if changelog_monitor.pending_entries and force:
+            logger.warning(f"Force posting despite {len(changelog_monitor.pending_entries)} pending entries")
+        
         logger.info("\n=== Posting to Reddit ===")
         logger.info(f"Entry ID: {entry_id if entry_id else 'Latest'}")
         logger.info(f"Force mode: {force}")
@@ -1172,31 +1680,25 @@ async def post_to_reddit(entry_id: Optional[str] = None, force: bool = False, ba
             raise HTTPException(
                 status_code=500, detail="Failed to import Reddit poster module")
 
-        # Get the entry to post
+        # Get the entry to post with mentions cleaned
         if entry_id:
-            # Get specific entry
-            changelogs = await get_changelog(all=True)
+            # Get specific entry with mentions cleaned
+            changelogs = await get_changelog(all=True, clean_mentions=True)
             entry = next(
                 (e for e in changelogs["changelogs"] if e["id"] == entry_id), None)
             if not entry:
                 raise HTTPException(
                     status_code=404, detail=f"Changelog entry {entry_id} not found")
         else:
-            # Get latest entry
-            changelogs = await get_changelog(all=False)
+            # Get latest entry with mentions cleaned
+            changelogs = await get_changelog(all=False, clean_mentions=True)
             if not changelogs["changelogs"]:
                 raise HTTPException(
                     status_code=404, detail="No changelog entries found")
             entry = changelogs["changelogs"][0]
 
-        logger.info(f"Processing entry: {entry['id']} by {entry['author']}")
+        logger.info(f"Processing entry: {entry['id']} by {entry['author']} (mentions cleaned)")
 
-        # If batch mode is disabled, use the original single-entry logic
-        if not batch:
-            # Check for duplicates and post single entry
-            # (Keep existing single-entry logic here)
-            pass
-        
         # Post to Reddit using the batching function
         success, message = await reddit_poster.post_changelog_to_reddit(entry, force=force)
 
@@ -1239,12 +1741,27 @@ async def post_to_reddit(entry_id: Optional[str] = None, force: bool = False, ba
         raise HTTPException(status_code=500, detail=str(e))
     
 @app.post("/reddit/post-all-entries", dependencies=[Depends(verify_token)])
-async def post_all_entries_to_reddit():
+async def post_all_entries_to_reddit(force: bool = False):
     """
     Post all unpublished changelog entries to Reddit.
+    
+    Parameters:
+    - force: If True, bypasses monitor warnings (optional)
+    
     Requires X-Patcher-Token header for authentication.
     """
     try:
+        # Check monitor state first
+        if changelog_monitor.pending_entries and not force:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Monitor has {len(changelog_monitor.pending_entries)} pending entries. "
+                       f"Use force=true to override or wait for automatic processing."
+            )
+        
+        if changelog_monitor.pending_entries and force:
+            logger.warning(f"Force posting all entries despite {len(changelog_monitor.pending_entries)} pending entries")
+        
         logger.info("\n=== Posting All Unpublished Entries to Reddit ===")
 
         # Import the Reddit poster
@@ -1465,7 +1982,185 @@ async def test_reddit_flair():
     except Exception as e:
         logger.error(f"Error in test_reddit_flair: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+    
+@app.post("/wiki/sync-changelog", dependencies=[Depends(verify_token)])
+async def sync_wiki_changelog():
+    """
+    Manually sync all changelog entries to wiki, checking for duplicates.
+    Requires X-Patcher-Token header for authentication.
+    """
+    if not all([WIKI_API_URL, WIKI_API_KEY, WIKI_PAGE_ID]):
+        raise HTTPException(
+            status_code=500,
+            detail="Wiki integration is not fully configured"
+        )
+    
+    try:
+        # Get all changelogs
+        changelogs_response = await get_changelog(all=True)
+        all_entries = changelogs_response.get("changelogs", [])
+        
+        if not all_entries:
+            return {
+                "status": "success",
+                "message": "No changelogs found to sync"
+            }
+        
+        # Update wiki with all entries (function will check for duplicates)
+        success = await update_wiki_with_new_entries(all_entries)
+        
+        if success:
+            return {
+                "status": "success",
+                "message": f"Wiki sync completed. Checked {len(all_entries)} entries."
+            }
+        else:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to sync wiki"
+            )
+            
+    except Exception as e:
+        logger.error(f"Error syncing wiki: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
+
+@app.post("/wiki/rebuild-changelog", dependencies=[Depends(verify_token)])
+async def rebuild_wiki_changelog():
+    """
+    Rebuild the entire wiki changelog page with all entries in correct order (newest first).
+    This will replace all content on the wiki page.
+    Discord mentions are cleaned before posting.
+    Requires X-Patcher-Token header for authentication.
+    """
+    if not all([WIKI_API_URL, WIKI_API_KEY, WIKI_PAGE_ID]):
+        raise HTTPException(
+            status_code=500,
+            detail="Wiki integration is not fully configured"
+        )
+    
+    try:
+        # Get all changelogs
+        changelogs_response = await get_changelog(all=True)
+        all_entries = changelogs_response.get("changelogs", [])
+        
+        if not all_entries:
+            return {
+                "status": "success",
+                "message": "No changelogs found"
+            }
+        
+        # Sort all entries by ID in DESCENDING order (newest first)
+        all_entries.sort(key=lambda x: int(x['id']), reverse=True)
+        
+        # Build the complete wiki content
+        wiki_content = WIKI_HEADER + "\n\n"
+        
+        for entry in all_entries:
+            try:
+                entry_time = datetime.fromisoformat(entry["timestamp"].replace("Z", "+00:00")).strftime("%Y-%m-%d %H:%M")
+            except:
+                entry_time = entry["timestamp"]
+                
+            wiki_content += f"## {entry_time} - Entry {entry['id']}\n"
+            wiki_content += f"**Author:** {entry['author']}\n\n"
+            
+            # Clean Discord mentions from content
+            content = entry['content'].strip()
+            cleaned_content = clean_discord_mentions(content)
+            
+            if cleaned_content.startswith('```'):
+                wiki_content += cleaned_content + "\n\n"
+            else:
+                wiki_content += cleaned_content + "\n\n"
+            wiki_content += "---\n\n"
+        
+        # Update the wiki page
+        page_id = int(WIKI_PAGE_ID)
+        success = await update_wiki_page(wiki_content, page_id)
+        
+        if success:
+            return {
+                "status": "success",
+                "message": f"Wiki rebuilt with {len(all_entries)} entries (newest first, Discord mentions cleaned)"
+            }
+        else:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to update wiki page"
+            )
+            
+    except Exception as e:
+        logger.error(f"Error rebuilding wiki: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+    
+@app.post("/wiki/test-connection", dependencies=[Depends(verify_token)])
+async def test_wiki_connection():
+    """
+    Test the connection to Wiki.js and verify authentication.
+    Requires X-Patcher-Token header for authentication.
+    """
+    if not all([WIKI_API_URL, WIKI_API_KEY, WIKI_PAGE_ID]):
+        raise HTTPException(
+            status_code=500,
+            detail="Wiki integration is not fully configured"
+        )
+    
+    try:
+        headers = {
+            'Authorization': f'Bearer {WIKI_API_KEY}',
+            'Content-Type': 'application/json'
+        }
+        
+        # Simple query to test connection
+        test_query = """
+        query {
+          pages {
+            list {
+              id
+              title
+            }
+          }
+        }
+        """
+        
+        timeout = aiohttp.ClientTimeout(total=10)
+        
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                WIKI_API_URL,
+                json={"query": test_query},
+                headers=headers
+            ) as response:
+                status = response.status
+                data = await response.json()
+                
+                if status == 200 and 'data' in data:
+                    page_count = len(data.get('data', {}).get('pages', {}).get('list', []))
+                    return {
+                        "status": "success",
+                        "message": "Wiki.js connection successful",
+                        "api_url": WIKI_API_URL,
+                        "page_id": WIKI_PAGE_ID,
+                        "pages_found": page_count
+                    }
+                else:
+                    return {
+                        "status": "error",
+                        "message": "Wiki.js connection failed",
+                        "http_status": status,
+                        "response": data
+                    }
+                    
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail="Connection to Wiki.js timed out"
+        )
+    except Exception as e:
+        logger.error(f"Error testing wiki connection: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+    
 @app.get("/heartbeat")
 async def heartbeat():
     """

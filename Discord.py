@@ -133,14 +133,15 @@ async def health_check():
                 f"Interval: {current_interval}s"
             ]
             
+            #Add periodic changelog sync every 5th check
+            if check_count % 5 == 0 and changelog_channel:
+                logger.info("Performing periodic changelog sync check")
+                await sync_changelog_on_startup()
+
             # Add info about channels being monitored
             changelog_channel = client.get_channel(CHANGELOG_CHANNEL_ID)
             if changelog_channel:
                 heartbeat_lines.append(f"Monitoring changelog channel: #{changelog_channel.name}")
-                
-                # Check for new changelog messages during heartbeat
-                updates_found = await check_for_changelog_updates()
-                heartbeat_lines.append(f"Changelog check: {'Updates found and applied' if updates_found else 'No new updates'}")
             
             if EXP_BOOST_CHANNEL_ID:
                 exp_channel = client.get_channel(EXP_BOOST_CHANNEL_ID)
@@ -278,30 +279,6 @@ async def on_message(message):
         try:
             await update_changelog_file(message)
             logger.info("Successfully updated changelog.md file")
-
-            
-            # Post to Reddit
-            try:
-                reddit_poster = import_reddit_poster()
-                if reddit_poster:
-                    # Create entry object for the new message
-                    entry = {
-                        "id": str(message.id),
-                        "author": message.author.display_name,
-                        "timestamp": message.created_at.isoformat(),
-                        "content": message.content
-                    }
-
-                    
-                    # Post to Reddit as a new post
-                    success, result_message = reddit_poster.post_changelog_to_reddit(entry)
-                    if success:
-                        logger.info(f"Successfully posted to Reddit: {result_message}")
-                    else:
-                        logger.error(f"Failed to post to Reddit: {result_message}")
-            except Exception as e:
-                logger.error(f"Error posting to Reddit: {str(e)}")
-                logger.error(traceback.format_exc())
         except Exception as e:
             logger.error(f"Error updating changelog.md: {str(e)}")
             logger.error(traceback.format_exc())
@@ -437,6 +414,8 @@ async def update_changelog_file(message):
         logger.info(f"Writing updated content to changelog.md")
         with open(CHANGELOG_PATH, "w") as md_file:
             md_file.write(content)
+            md_file.flush()  # Ensure all data is written immediately
+            os.fsync(md_file.fileno())  # Ensure data is flushed to disk
             
         # Also save the last message ID to a file for tracking
         save_last_message_info(message)
@@ -446,12 +425,30 @@ async def update_changelog_file(message):
         logger.error(traceback.format_exc())
         raise
 
+def clean_discord_mentions(content):
+    """
+    Remove Discord user mentions from changelog content.
+    """
+    import re
+    
+    # Remove Discord user ID mentions in format ( <@123456789> )
+    content = re.sub(r'\s*\(\s*<@\d+>\s*\)', '', content)
+    
+    # Remove @ mentions in format ( @Username)
+    # content = re.sub(r'\s*\(\s*@[\w\s]+\)', '', content)
+    
+    # Clean up any trailing spaces left behind
+    lines = content.split('\n')
+    cleaned_lines = [line.rstrip() for line in lines]
+    
+    return '\n'.join(cleaned_lines)
+
 def format_changelog_entry(message):
     """Format a Discord message as a changelog entry"""
     entry = f"## Entry {message.id}\n"
     entry += f"**Author:** {message.author.display_name}\n"
     entry += f"**Date:** {message.created_at.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-    entry += f"{message.content}\n\n"
+    entry += f"{clean_discord_mentions(message.content)}\n\n"  
     entry += "---\n\n"
     return entry
 
@@ -537,47 +534,3 @@ async def on_guild_available(guild):
 async def on_member_join(member):
     logger.info(f"Member joined: {member.name} (ID: {member.id})")
     # This is just for testing Discord events - we don't need to take any action
-
-async def check_for_changelog_updates():
-    """Check for new messages in the changelog channel and update the changelog.md file"""
-    try:
-        logger.info("Checking for new changelog messages...")
-        
-        # Get changelog channel
-        channel = client.get_channel(CHANGELOG_CHANNEL_ID)
-        if not channel:
-            logger.error(f"Changelog channel with ID {CHANGELOG_CHANNEL_ID} not found.")
-            return False
-        
-        # Read existing changelog entries to avoid duplicates
-        existing_ids = set()
-        if os.path.exists(CHANGELOG_PATH):
-            with open(CHANGELOG_PATH, "r") as md_file:
-                content = md_file.read()
-                # Extract message IDs from the changelog file
-                existing_ids = set([m for m in re.findall(r"## Entry (\d+)", content)])
-                logger.info(f"Found {len(existing_ids)} existing entries in changelog.md")
-        
-        # Get recent messages from the channel (limit to last 50 to be efficient)
-        new_entries = []
-        async for message in channel.history(limit=50):
-            if str(message.id) not in existing_ids and message.content.strip():
-                logger.info(f"Found new changelog entry: {message.id}")
-                new_entries.append(message)
-        
-        # Process new entries (newest last to maintain chronological order in file)
-        if new_entries:
-            logger.info(f"Adding {len(new_entries)} new changelog entries to changelog.md")
-            # Sort by timestamp to ensure oldest first
-            new_entries.sort(key=lambda msg: msg.created_at)
-            for msg in new_entries:
-                await update_changelog_file(msg)
-            return True
-        else:
-            logger.info("No new changelog entries found.")
-            return False
-            
-    except Exception as e:
-        logger.error(f"Error checking for changelog updates: {str(e)}")
-        logger.error(traceback.format_exc())
-        return False
