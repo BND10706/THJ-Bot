@@ -21,6 +21,8 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.types import ASGIApp
 import importlib.util
 import traceback
+from file_operations import SafeFileOperations
+from startup_lock import StartupLock
 
 # Configure logging for Azure
 logging.basicConfig(
@@ -84,12 +86,12 @@ VALUE_CHANNEL_ID = 1319011465960882197
 
 API_BASE_URL = os.getenv('API_BASE_URL')
 
-CHANGELOG_PATH = "/app/changelog.md"
+CHANGELOG_PATH = "/app/data/changelog.md"
 # Add path for ServerStatus.md
-SERVER_STATUS_PATH = "/app/ServerStatus.md"
+SERVER_STATUS_PATH = "/app/data/ServerStatus.md"
 
 # Add path for changelog processing state
-PROCESSING_STATE_PATH = "/app/changelog_processing_state.json"
+PROCESSING_STATE_PATH = "/app/data/changelog_processing_state.json"
 
 
 def mask_sensitive_string(s: str) -> str:

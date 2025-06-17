@@ -10,6 +10,8 @@ import re
 import traceback
 import aiohttp
 import importlib.util
+from file_operations import SafeFileOperations
+import traceback
 
 # Load environment variables
 load_dotenv()
@@ -35,8 +37,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Define the paths to the files
-CHANGELOG_PATH = "/app/changelog.md"  # Using the same path as in Patcher_API.py
-SERVER_STATUS_PATH = "/app/ServerStatus.md"  # New path for server status
+CHANGELOG_PATH = "/app/data/changelog.md"  # Using the same path as in Patcher_API.py
+SERVER_STATUS_PATH = "/app/data/ServerStatus.md"  # New path for server status
 
 # Set up Discord client with reconnect enabled
 intents = discord.Intents.default()
@@ -349,74 +351,34 @@ async def update_server_status_from_channel(channel):
 async def update_changelog_file(message):
     """Update the changelog.md file with a new message"""
     try:
-        # Log file path and check permissions
         logger.info(f"Attempting to update changelog file at: {CHANGELOG_PATH}")
         
-        # Check file permissions if the file exists
-        if os.path.exists(CHANGELOG_PATH):
-            try:
-                # Check if file is readable
-                with open(CHANGELOG_PATH, "r") as test_read:
-                    test_read.read(1)
-                logger.info("Changelog file is readable")
-                
-                # Check if file is writable
-                with open(CHANGELOG_PATH, "a") as test_write:
-                    test_write.write("")
-                logger.info("Changelog file is writable")
-            except Exception as e:
-                logger.error(f"Permission issue with changelog file: {str(e)}")
-        else:
-            logger.info("Changelog file does not exist yet and will be created")
-            
-            # Check if directory is writable
-            try:
-                dir_path = os.path.dirname(CHANGELOG_PATH)
-                os.makedirs(dir_path, exist_ok=True)
-                test_file = os.path.join(dir_path, "test_permissions.tmp")
-                with open(test_file, "w") as f:
-                    f.write("test")
-                os.remove(test_file)
-                logger.info("Directory is writable")
-            except Exception as e:
-                logger.error(f"Directory permission issue: {str(e)}")
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(CHANGELOG_PATH), exist_ok=True)
         
         # Format the new entry
         new_entry = format_changelog_entry(message)
         
-        # Check if file exists
-        if not os.path.exists(CHANGELOG_PATH):
+        # Read existing content safely
+        existing_content = SafeFileOperations.safe_read(CHANGELOG_PATH)
+        
+        if not existing_content:
             # Create initial file if it doesn't exist
             logger.info(f"Creating new changelog.md file at {CHANGELOG_PATH}")
-            content = "# Changelog\n\n"
-            content += new_entry
+            content = "# Changelog\n\n" + new_entry
         else:
-            # Read existing content
-            logger.info(f"Reading existing changelog.md file")
-            try:
-                with open(CHANGELOG_PATH, "r") as md_file:
-                    content = md_file.read()
-                
-                # Add new entry after the header, at the top of the entries
-                if "# Changelog" in content:
-                    parts = content.split("# Changelog\n\n", 1)
-                    content = "# Changelog\n\n" + new_entry + parts[1] if len(parts) > 1 else "# Changelog\n\n" + new_entry
-                else:
-                    # If for some reason header is missing, add it
-                    content = "# Changelog\n\n" + new_entry + content
-            except Exception as e:
-                logger.error(f"Error reading changelog.md: {str(e)}")
-                logger.error(traceback.format_exc())
-                # Create new file if reading fails
-                content = "# Changelog\n\n" + new_entry
+            # Add new entry after the header, at the top of the entries
+            if "# Changelog" in existing_content:
+                parts = existing_content.split("# Changelog\n\n", 1)
+                content = "# Changelog\n\n" + new_entry + (parts[1] if len(parts) > 1 else "")
+            else:
+                # If for some reason header is missing, add it
+                content = "# Changelog\n\n" + new_entry + existing_content
         
-        # Write updated content
-        logger.info(f"Writing updated content to changelog.md")
-        with open(CHANGELOG_PATH, "w") as md_file:
-            md_file.write(content)
-            md_file.flush()  # Ensure all data is written immediately
-            os.fsync(md_file.fileno())  # Ensure data is flushed to disk
-            
+        # Write atomically
+        SafeFileOperations.atomic_write(CHANGELOG_PATH, content)
+        logger.info("Successfully updated changelog.md")
+        
         # Also save the last message ID to a file for tracking
         save_last_message_info(message)
         
@@ -448,7 +410,7 @@ def format_changelog_entry(message):
     entry = f"## Entry {message.id}\n"
     entry += f"**Author:** {message.author.display_name}\n"
     entry += f"**Date:** {message.created_at.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-    entry += f"{clean_discord_mentions(message.content)}\n\n"  
+    entry += f"{clean_discord_mentions(message.content)}\n\n"
     entry += "---\n\n"
     return entry
 
