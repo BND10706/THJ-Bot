@@ -28,7 +28,7 @@ REDDIT_USERNAME = os.getenv('REDDIT_USERNAME')
 REDDIT_PASSWORD = os.getenv('REDDIT_PASSWORD')
 REDDIT_USER_AGENT = os.getenv('REDDIT_USER_AGENT', 'ChangelogPoster by /u/YourUsername')
 REDDIT_SUBREDDIT = os.getenv('REDDIT_SUBREDDIT')
-REDDIT_FLAIR_NAME = os.getenv('REDDIT_FLAIR_NAME', 'Announcement')  # Default to 'Announcement'
+REDDIT_FLAIR_NAME = os.getenv('REDDIT_FLAIR_NAME', 'Change-Log')  # Default to 'Change-Log'
 
 # Path to store Reddit posts information
 REDDIT_POSTS_PATH = "/app/reddit_posts.json"

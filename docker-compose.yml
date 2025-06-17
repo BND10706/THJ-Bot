@@ -28,8 +28,12 @@ services:
       - REDDIT_USER_AGENT=${REDDIT_USER_AGENT:-}
       - REDDIT_SUBREDDIT=${REDDIT_SUBREDDIT:-}
       - REDDIT_FLAIR_NAME=${REDDIT_FLAIR_NAME:-}
+      # Race condition prevention
+      - PRIMARY_WRITER=discord-bot
+      - ENABLE_STARTUP_SYNC=false
     volumes:
       - ./logs:/app/logs
+      - ./data:/app/data
     networks:
       - changelog-network
     command: ['python', 'Patcher_API.py']
@@ -43,10 +47,13 @@ services:
     environment:
       - DISCORD_TOKEN=${DISCORD_TOKEN}
       - CHANGELOG_CHANNEL_ID=${CHANGELOG_CHANNEL_ID}
+      - EXP_BOOST_CHANNEL_ID=${EXP_BOOST_CHANNEL_ID:-}
       - HEARTBEAT_INTERVAL=${HEARTBEAT_INTERVAL:-300}
       - PYTHONUNBUFFERED=1
+      - PRIMARY_WRITER=discord-bot
     volumes:
       - ./logs:/app/logs
+      - ./data:/app/data
     networks:
       - changelog-network
     command: ['python', 'Discord.py']
@@ -62,6 +69,7 @@ services:
       - CHANGELOG_CHANNEL_ID=${CHANGELOG_CHANNEL_ID}
     volumes:
       - ./logs:/app/logs
+      - ./data:/app/data
     networks:
       - changelog-network
     command: ['python', 'reddit_poster.py']
