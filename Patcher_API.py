@@ -901,7 +901,7 @@ async def get_changelog(message_id: Optional[str] = None, all: Optional[bool] = 
         logger.error(f"Error fetching changelogs: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
     
-async def create_wiki_page(title: str, path: str, content: str) -> bool:
+async def create_wiki_page_with_id(title: str, path: str, content: str) -> bool:
     """
     Create a new wiki page or update if it exists.
     Returns True if successful, False otherwise.
@@ -914,9 +914,9 @@ async def create_wiki_page(title: str, path: str, content: str) -> bool:
         
         # First, check if page exists
         check_query = """
-        query GetPageByPath($path: String!) {
+        query GetPageByPath($path: String!, $locale: String!) {
           pages {
-            singleByPath(path: $path, locale: "en") {
+            singleByPath(path: $path, locale: $locale) {
               id
             }
           }
@@ -924,13 +924,15 @@ async def create_wiki_page(title: str, path: str, content: str) -> bool:
         """
         
         check_variables = {
-            "path": path
+            "path": path,
+            "locale": "en"
         }
         
         timeout = aiohttp.ClientTimeout(total=30)
         
         async with aiohttp.ClientSession(timeout=timeout) as session:
             # Check if page exists
+            logger.info(f"Checking if page exists: {path}")
             async with session.post(
                 WIKI_API_URL,
                 json={"query": check_query, "variables": check_variables},
@@ -938,20 +940,33 @@ async def create_wiki_page(title: str, path: str, content: str) -> bool:
             ) as response:
                 if response.status == 200:
                     data = await response.json()
+                    
+                    if 'errors' in data:
+                        logger.warning(f"GraphQL errors checking page: {data['errors']}")
+                    
                     existing_page = data.get('data', {}).get('pages', {}).get('singleByPath')
                     
                     if existing_page and existing_page.get('id'):
                         # Page exists, update it
-                        logger.info(f"Page {path} exists with ID {existing_page['id']}, updating...")
-                        return await update_wiki_page(content, existing_page['id'])
+                        page_id = int(existing_page['id'])
+                        logger.info(f"Page {path} exists with ID {page_id}, updating...")
+                        return await update_wiki_page(content, page_id)
                     else:
                         # Page doesn't exist, create it
                         logger.info(f"Page {path} doesn't exist, creating...")
                         
+                        # Create mutation with forced rendering
                         create_mutation = """
-                        mutation CreatePage($input: PageCreateInput!) {
+                        mutation CreatePage($content: String!, $path: String!, $title: String!, $locale: String!, $isPublished: Boolean!, $isPrivate: Boolean!) {
                           pages {
-                            create(input: $input) {
+                            create(
+                              content: $content,
+                              path: $path,
+                              title: $title,
+                              locale: $locale,
+                              isPublished: $isPublished,
+                              isPrivate: $isPrivate
+                            ) {
                               responseResult {
                                 succeeded
                                 errorCode
@@ -968,14 +983,12 @@ async def create_wiki_page(title: str, path: str, content: str) -> bool:
                         """
                         
                         create_variables = {
-                            "input": {
-                                "title": title,
-                                "path": path,
-                                "content": content,
-                                "locale": "en",
-                                "isPublished": True,
-                                "isPrivate": False
-                            }
+                            "title": title,
+                            "path": path,
+                            "content": content,
+                            "locale": "en",
+                            "isPublished": True,  # Force publishing and rendering
+                            "isPrivate": False
                         }
                         
                         async with session.post(
@@ -994,19 +1007,52 @@ async def create_wiki_page(title: str, path: str, content: str) -> bool:
                                 response_result = result.get('responseResult', {})
                                 
                                 if response_result.get('succeeded', False):
-                                    logger.info(f"Successfully created page: {path}")
-                                    return True
+                                    created_page = result.get('page', {})
+                                    page_id = created_page.get('id')
+                                    logger.info(f"✅ Successfully created page: {path}")
+                                    logger.info(f"- Page ID: {page_id}")
+                                    logger.info(f"- Title: {created_page.get('title', 'N/A')}")
+                                    
+                                    # Force render the new page
+                                    if page_id:
+                                        render_mutation = """
+                                        mutation RenderPage($id: Int!) {
+                                          pages {
+                                            render(id: $id) {
+                                              responseResult {
+                                                succeeded
+                                                message
+                                              }
+                                            }
+                                          }
+                                        }
+                                        """
+                                        
+                                        async with session.post(
+                                            WIKI_API_URL,
+                                            json={"query": render_mutation, "variables": {"id": int(page_id)}},
+                                            headers=headers
+                                        ) as render_response:
+                                            if render_response.status == 200:
+                                                logger.info("✅ Page rendered successfully")
+                                    
+                                    return int(page_id) if page_id else True
                                 else:
                                     logger.error(f"Failed to create page: {response_result.get('message', 'Unknown error')}")
-                                    return False
+                                    logger.error(f"- Error Code: {response_result.get('errorCode', 'N/A')}")
+                                    return None
                             else:
+                                error_text = await create_response.text()
                                 logger.error(f"HTTP error creating page: {create_response.status}")
+                                logger.error(f"Response: {error_text[:500]}")
                                 return False
                 else:
-                    error_text = await create_response.text()
-                    logger.error(f"HTTP error creating page: {create_response.status} - {error_text}")
+                    logger.error(f"Failed to check if page exists: HTTP {response.status}")
                     return False
                     
+    except asyncio.TimeoutError:
+        logger.error("Request timed out")
+        return False
     except Exception as e:
         logger.error(f"Error in create_wiki_page: {str(e)}")
         logger.error(traceback.format_exc())
@@ -1298,7 +1344,7 @@ async def update_wiki_with_new_entries(new_entries):
 
 async def update_wiki_page(content: str, page_id: int) -> bool:
     """
-    Update the specified wiki page with new content and render it to make it visible.
+    Update the specified wiki page with new content and force render via unpublish/republish.
     Returns True if successful, False otherwise.
     """
     try:
@@ -1319,15 +1365,15 @@ async def update_wiki_page(content: str, page_id: int) -> bool:
         logger.info("Content Analysis:")
         logger.info(f"- Total length: {len(content)} characters")
         logger.info(f"- First 100 chars: {content[:100]}")
-        logger.info(
-            f"- Last 100 chars: {content[-100:] if len(content) > 100 else content}")
-        logger.info("- Number of lines: {}".format(content.count('\n') + 1))
+        logger.info(f"- Last 100 chars: {content[-100:] if len(content) > 100 else content}")
+        line_count = content.count('\n') + 1
+        logger.info(f"- Number of lines: {line_count}")
 
-        # Update mutation with isPublished
+        # Step 1: Update content
         update_mutation = """
-        mutation UpdatePage($id: Int!, $input: PageUpdateInput!) {
+        mutation UpdatePage($id: Int!, $content: String!, $isPublished: Boolean!) {
           pages {
-            update(id: $id, input: $input) {
+            update(id: $id, content: $content, isPublished: $isPublished) {
               responseResult {
                 succeeded
                 errorCode
@@ -1338,92 +1384,208 @@ async def update_wiki_page(content: str, page_id: int) -> bool:
           }
         }
         """
-        variables = {
-            "id": page_id,
-            "input": {
-                "content": content,
-                "isPublished": True
-            }
-        }
-
-        # Log request details
-        logger.info("\nRequest Details:")
-        logger.info(f"- API URL: {WIKI_API_URL}")
-        logger.info(f"- Update Mutation: {update_mutation.strip()}")
-        logger.info(
-            f"- Variables: id={page_id}, content_length={len(content)}")
-
+        
         # Add timeout to prevent hanging
         timeout = aiohttp.ClientTimeout(total=30)
         
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            # Step 1: Update content with isPublished
-            logger.info("\nExecuting update mutation...")
+            # Update content (keep published for now)
+            logger.info("\nStep 1: Updating page content...")
             try:
                 async with session.post(
                     WIKI_API_URL,
-                    json={"query": update_mutation, "variables": variables},
+                    json={
+                        "query": update_mutation, 
+                        "variables": {
+                            "id": page_id,
+                            "content": content,
+                            "isPublished": True
+                        }
+                    },
                     headers=headers
                 ) as response:
                     response_status = response.status
                     response_text = await response.text()
                     
-                    logger.info(f"\nUpdate Response Analysis:")
-                    logger.info(f"- HTTP Status: {response_status}")
+                    logger.info(f"Update Response - HTTP Status: {response_status}")
                     
-                    # Try to parse as JSON
                     try:
                         response_data = json.loads(response_text)
-                        logger.info(
-                            f"- Raw Response: {json.dumps(response_data, indent=2)}")
                     except json.JSONDecodeError:
-                        logger.error(f"- Raw Response (not JSON): {response_text[:500]}")
+                        logger.error(f"Raw Response (not JSON): {response_text[:500]}")
+                        return False
+
+                    if response_status != 200:
+                        logger.error(f"HTTP error: {response_status}")
                         return False
 
                     if 'errors' in response_data:
-                        logger.error("\nGraphQL Errors in update:")
+                        logger.error("GraphQL Errors in update:")
                         for error in response_data['errors']:
-                            logger.error(f"- Path: {error.get('path', 'N/A')}")
-                            logger.error(
-                                f"- Message: {error.get('message', 'N/A')}")
-                            logger.error(
-                                f"- Extensions: {error.get('extensions', {})}")
+                            logger.error(f"- Message: {error.get('message', 'N/A')}")
                         return False
 
-                    update_result = response_data.get('data', {}).get(
-                        'pages', {}).get('update', {}).get('responseResult', {})
+                    update_result = response_data.get('data', {}).get('pages', {}).get('update', {}).get('responseResult', {})
 
-                    # Check if update was successful
-                    if update_result.get('succeeded', False):
-                        logger.info(f"\n✅ Successfully updated page")
-                        logger.info(f"- Slug: {update_result.get('slug', 'N/A')}")
-                        logger.info(f"- Message: {update_result.get('message', 'N/A')}")
-                        return True
-                    else:
-                        # Handle the known 'map' error
-                        if update_result.get('message') == "Cannot read properties of undefined (reading 'map')":
-                            logger.warning(
-                                "\n⚠️ Received 'map' error - this might be a Wiki.js bug but the update may have succeeded")
-                            # You might want to verify the update by fetching the page
-                            return True
-                        else:
-                            logger.error(
-                                f"\n❌ Failed to update page: {update_result.get('message', 'Unknown error')}")
-                            logger.error(f"- Error Code: {update_result.get('errorCode', 'N/A')}")
+                    if not update_result.get('succeeded', False):
+                        error_message = update_result.get('message', 'Unknown error')
+                        if "Cannot read properties of undefined (reading 'map')" not in error_message:
+                            logger.error(f"Failed to update page: {error_message}")
                             return False
+                        else:
+                            logger.warning("Received 'map' error - continuing with unpublish/republish")
+
+                # Step 2: Unpublish the page
+                logger.info("\nStep 2: Unpublishing page to force re-render...")
+                await asyncio.sleep(1)  # Small delay
+                
+                async with session.post(
+                    WIKI_API_URL,
+                    json={
+                        "query": update_mutation,
+                        "variables": {
+                            "id": page_id,
+                            "content": content,
+                            "isPublished": False
+                        }
+                    },
+                    headers=headers
+                ) as unpublish_response:
+                    if unpublish_response.status != 200:
+                        logger.warning(f"Unpublish returned status {unpublish_response.status}")
+                    else:
+                        unpublish_data = await unpublish_response.json()
+                        if 'errors' not in unpublish_data:
+                            logger.info("✅ Page unpublished")
+
+                # Step 3: Re-publish the page
+                logger.info("\nStep 3: Re-publishing page to complete render...")
+                await asyncio.sleep(1)  # Small delay
+                
+                async with session.post(
+                    WIKI_API_URL,
+                    json={
+                        "query": update_mutation,
+                        "variables": {
+                            "id": page_id,
+                            "content": content,
+                            "isPublished": True
+                        }
+                    },
+                    headers=headers
+                ) as republish_response:
+                    if republish_response.status == 200:
+                        republish_data = await republish_response.json()
+                        if 'errors' not in republish_data:
+                            republish_result = republish_data.get('data', {}).get('pages', {}).get('update', {}).get('responseResult', {})
+                            if republish_result.get('succeeded', False):
+                                logger.info("✅ Page re-published and rendered successfully")
+                                return True
+                            else:
+                                logger.error(f"Re-publish failed: {republish_result.get('message', 'Unknown error')}")
+                                return False
+                    
+                    logger.error(f"Re-publish HTTP error: {republish_response.status}")
+                    return False
                             
             except asyncio.TimeoutError:
-                logger.error("\n❌ Request timed out after 30 seconds")
+                logger.error("Request timed out after 30 seconds")
                 return False
             except aiohttp.ClientError as e:
-                logger.error(f"\n❌ HTTP Client Error: {str(e)}")
+                logger.error(f"HTTP Client Error: {str(e)}")
                 return False
 
     except Exception as e:
-        logger.error(f"❌ Error in update_wiki_page: {type(e).__name__}")
+        logger.error(f"Error in update_wiki_page: {type(e).__name__}")
         logger.error(f"Error details: {str(e)}")
         logger.error(traceback.format_exc())
         return False
+    
+async def force_render_pages(page_ids: list) -> bool:
+    """
+    Force render multiple pages by unpublishing and republishing them.
+    Used after creating/updating multiple pages.
+    """
+    if not page_ids:
+        return True
+        
+    logger.info(f"\n=== Force Rendering {len(page_ids)} Pages ===")
+    
+    headers = {
+        'Authorization': f'Bearer {WIKI_API_KEY}',
+        'Content-Type': 'application/json'
+    }
+    
+    update_mutation = """
+    mutation UpdatePage($id: Int!, $isPublished: Boolean!) {
+      pages {
+        update(id: $id, isPublished: $isPublished) {
+          responseResult {
+            succeeded
+            errorCode
+            message
+          }
+        }
+      }
+    }
+    """
+    
+    timeout = aiohttp.ClientTimeout(total=30)
+    success_count = 0
+    
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        # Unpublish all pages
+        logger.info("Unpublishing pages...")
+        for page_id in page_ids:
+            try:
+                async with session.post(
+                    WIKI_API_URL,
+                    json={
+                        "query": update_mutation,
+                        "variables": {
+                            "id": page_id,
+                            "isPublished": False
+                        }
+                    },
+                    headers=headers
+                ) as response:
+                    if response.status == 200:
+                        logger.info(f"- Unpublished page {page_id}")
+            except Exception as e:
+                logger.warning(f"- Failed to unpublish page {page_id}: {str(e)}")
+        
+        # Wait a moment
+        await asyncio.sleep(2)
+        
+        # Re-publish all pages
+        logger.info("Re-publishing pages...")
+        for page_id in page_ids:
+            try:
+                async with session.post(
+                    WIKI_API_URL,
+                    json={
+                        "query": update_mutation,
+                        "variables": {
+                            "id": page_id,
+                            "isPublished": True
+                        }
+                    },
+                    headers=headers
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if 'errors' not in data:
+                            result = data.get('data', {}).get('pages', {}).get('update', {}).get('responseResult', {})
+                            if result.get('succeeded', False):
+                                logger.info(f"- Re-published page {page_id}")
+                                success_count += 1
+                            else:
+                                logger.warning(f"- Failed to re-publish page {page_id}: {result.get('message', 'Unknown')}")
+            except Exception as e:
+                logger.warning(f"- Failed to re-publish page {page_id}: {str(e)}")
+    
+    logger.info(f"\n✅ Force rendered {success_count}/{len(page_ids)} pages")
+    return success_count > 0
     
 async def start_discord():
     """Start the Discord client"""
@@ -1440,14 +1602,20 @@ async def start_discord():
 def clean_discord_mentions(content):
     """
     Remove Discord user mentions from changelog content.
+    Removes patterns like ( <@123456789> ) from the end of lines.
+    Also handles @ mentions like (@Username).
     """
     import re
     
-    # Remove entire parenthetical phrases containing Discord mentions
-    content = re.sub(r'\s*\([^)]*<@\d+>[^)]*\)', '', content)
+    # Remove Discord user ID mentions in format ( <@123456789> )
+    # This regex matches the pattern with optional spaces
+    content = re.sub(r'\s*\(\s*<@\d+>\s*\)', '', content)
     
     # Remove @ mentions in format ( @Username)
     # content = re.sub(r'\s*\(\s*@[\w\s]+\)', '', content)
+    
+    # Remove entire parenthetical phrases containing Discord mentions
+    content = re.sub(r'\s*\([^)]*<@\d+>[^)]*\)', '', content)
     
     # Clean up any trailing spaces left behind
     lines = content.split('\n')
@@ -1455,6 +1623,39 @@ def clean_discord_mentions(content):
     
     return '\n'.join(cleaned_lines)
 
+async def verify_wiki_page_update(page_id: int, expected_content_length: int) -> bool:
+    """
+    Verify that a wiki page was successfully updated by checking its content length.
+    This is a workaround for the Wiki.js 'map' error that sometimes occurs.
+    """
+    try:
+        # Wait a moment for the update to propagate
+        await asyncio.sleep(2)
+        
+        # Fetch the page content
+        current_content = await get_wiki_page_content(page_id)
+        
+        if current_content is None:
+            logger.warning("Could not fetch page content for verification")
+            return False
+        
+        current_length = len(current_content)
+        
+        # Check if the content length is reasonably close to what we expect
+        # Allow for some variation due to Wiki.js processing
+        length_diff = abs(current_length - expected_content_length)
+        length_ratio = length_diff / expected_content_length if expected_content_length > 0 else 1
+        
+        if length_ratio < 0.1:  # Within 10% of expected length
+            logger.info(f"✅ Verification successful: content length {current_length} (expected ~{expected_content_length})")
+            return True
+        else:
+            logger.warning(f"⚠️ Content length mismatch: {current_length} vs expected {expected_content_length}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error verifying wiki update: {str(e)}")
+        return False
 
 # Changelog monitoring with debouncing
 class ChangelogMonitor:
@@ -2208,13 +2409,14 @@ async def test_reddit_flair():
     except Exception as e:
         logger.error(f"Error in test_reddit_flair: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-    
+
+"""  
 @app.post("/wiki/sync-changelog", dependencies=[Depends(verify_token)])
 async def sync_wiki_changelog():
-    """
+    """"""
     Manually sync all changelog entries to wiki, checking for duplicates.
     Requires X-Patcher-Token header for authentication.
-    """
+    """"""
     if not all([WIKI_API_URL, WIKI_API_KEY, WIKI_PAGE_ID]):
         raise HTTPException(
             status_code=500,
@@ -2249,76 +2451,7 @@ async def sync_wiki_changelog():
     except Exception as e:
         logger.error(f"Error syncing wiki: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/wiki/rebuild-changelog", dependencies=[Depends(verify_token)])
-async def rebuild_wiki_changelog():
-    """
-    Rebuild the entire wiki changelog page with all entries in correct order (newest first).
-    This will replace all content on the wiki page.
-    Discord mentions are cleaned before posting.
-    Requires X-Patcher-Token header for authentication.
-    """
-    if not all([WIKI_API_URL, WIKI_API_KEY, WIKI_PAGE_ID]):
-        raise HTTPException(
-            status_code=500,
-            detail="Wiki integration is not fully configured"
-        )
-    
-    try:
-        # Get all changelogs
-        changelogs_response = await get_changelog(all=True)
-        all_entries = changelogs_response.get("changelogs", [])
-        
-        if not all_entries:
-            return {
-                "status": "success",
-                "message": "No changelogs found"
-            }
-        
-        # Sort all entries by ID in DESCENDING order (newest first)
-        all_entries.sort(key=lambda x: int(x['id']), reverse=True)
-        
-        # Build the complete wiki content
-        wiki_content = WIKI_HEADER + "\n\n"
-        
-        for entry in all_entries:
-            try:
-                entry_time = datetime.fromisoformat(entry["timestamp"].replace("Z", "+00:00")).strftime("%Y-%m-%d %H:%M")
-            except:
-                entry_time = entry["timestamp"]
-                
-            wiki_content += f"## {entry_time} - Entry {entry['id']}\n"
-            wiki_content += f"**Author:** {entry['author']}\n\n"
-            
-            # Clean Discord mentions from content
-            content = entry['content'].strip()
-            cleaned_content = clean_discord_mentions(content)
-            
-            if cleaned_content.startswith('```'):
-                wiki_content += cleaned_content + "\n\n"
-            else:
-                wiki_content += cleaned_content + "\n\n"
-            wiki_content += "---\n\n"
-        
-        # Update the wiki page
-        page_id = int(WIKI_PAGE_ID)
-        success = await update_wiki_page(wiki_content, page_id)
-        
-        if success:
-            return {
-                "status": "success",
-                "message": f"Wiki rebuilt with {len(all_entries)} entries (newest first, Discord mentions cleaned)"
-            }
-        else:
-            raise HTTPException(
-                status_code=500,
-                detail="Failed to update wiki page"
-            )
-            
-    except Exception as e:
-        logger.error(f"Error rebuilding wiki: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        """
     
 @app.post("/wiki/create-monthly-archives", dependencies=[Depends(verify_token)])
 async def create_wiki_monthly_archives():
@@ -2346,6 +2479,9 @@ async def create_wiki_monthly_archives():
         
         # Organize by month
         entries_by_month = await organize_changelogs_by_month(all_entries)
+        
+        # Track created/updated page IDs for force rendering
+        updated_page_ids = []
         
         # Create main page with recent entries (last 30 days)
         main_page_content = WIKI_HEADER + "\n\n"
@@ -2442,7 +2578,8 @@ async def create_wiki_monthly_archives():
         
         # Update main page
         logger.info("Updating main changelog page...")
-        success = await update_wiki_page(main_page_content, int(WIKI_PAGE_ID))
+        main_page_id = int(WIKI_PAGE_ID)
+        success = await update_wiki_page(main_page_content, main_page_id)
         
         if not success:
             raise HTTPException(
@@ -2450,10 +2587,13 @@ async def create_wiki_monthly_archives():
                 detail="Failed to update main page"
             )
         
+        updated_page_ids.append(main_page_id)
+        
         # Create/update monthly archive pages
         pages_created = 0
         pages_updated = 0
         pages_failed = 0
+        created_page_ids = []
         
         for month_key, month_entries in entries_by_month.items():
             if month_key == "unknown":
@@ -2506,10 +2646,13 @@ async def create_wiki_monthly_archives():
                     
                     month_content += cleaned_content + "\n\n---\n\n"
                 
-                # Create or update the page
+                # Create or update the page and track the page ID
                 logger.info(f"Creating/updating page '{page_path}' with {len(month_entries)} entries...")
-                if await create_wiki_page(page_title, page_path, month_content):
+                page_result = await create_wiki_page_with_id(page_title, page_path, month_content)
+                if page_result:
                     pages_created += 1
+                    if isinstance(page_result, int):
+                        created_page_ids.append(page_result)
                 else:
                     pages_failed += 1
                     logger.error(f"Failed to create page for {month_name}")
@@ -2517,6 +2660,12 @@ async def create_wiki_monthly_archives():
             except Exception as e:
                 logger.error(f"Error processing month {month_key}: {str(e)}")
                 pages_failed += 1
+        
+        # Force render all updated pages
+        all_page_ids = updated_page_ids + created_page_ids
+        if all_page_ids:
+            logger.info(f"\nForce rendering {len(all_page_ids)} pages...")
+            await force_render_pages(all_page_ids)
         
         return {
             "status": "success",
@@ -2526,7 +2675,8 @@ async def create_wiki_monthly_archives():
                 "recent_entries": len(recent_entries),
                 "months_processed": len(entries_by_month) - (1 if "unknown" in entries_by_month else 0),
                 "pages_created": pages_created,
-                "pages_failed": pages_failed
+                "pages_failed": pages_failed,
+                "pages_rendered": len(all_page_ids)
             }
         }
         
